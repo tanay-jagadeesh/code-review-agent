@@ -1,5 +1,4 @@
 # Review endpoints — trigger, fetch, list history
-import asyncio
 import logging
 from datetime import datetime, timezone
 
@@ -12,7 +11,7 @@ from sqlalchemy.orm import selectinload
 from backend.db.database import get_db
 from backend.models.review import Review, ReviewComment
 from backend.services.github_service import parse_pr_url
-from backend.services.review_agent import run_review
+from backend.worker import run_review_task
 
 logger = logging.getLogger(__name__)
 
@@ -21,13 +20,13 @@ router = APIRouter()
 
 class TriggerRequest(BaseModel):
     pr_url: str
+    model: str | None = None
 
 
-@router.post("/trigger")
+@router.post("/trigger", status_code=202)
 async def trigger_review(body: TriggerRequest, db: AsyncSession = Depends(get_db)):
     owner, repo, pr_num = parse_pr_url(body.pr_url)
 
-    # Create review record
     review = Review(
         pr_url=body.pr_url,
         owner=owner,
@@ -39,38 +38,10 @@ async def trigger_review(body: TriggerRequest, db: AsyncSession = Depends(get_db
     await db.commit()
     await db.refresh(review)
 
-    # Run the review
-    try:
-        review.status = "in_progress"
-        await db.commit()
+    # Enqueue — returns immediately, Celery worker runs the review
+    run_review_task.delay(review.id, body.pr_url, body.model)
 
-        # Run sync review in a thread so we don't block the event loop
-        comments = await asyncio.to_thread(run_review, body.pr_url)
-
-        # Save comments to DB
-        for c in comments:
-            db_comment = ReviewComment(
-                review_id=review.id,
-                file=c.file if hasattr(c, "file") else c.get("file", ""),
-                line=c.line if hasattr(c, "line") else c.get("line", 0),
-                severity=c.severity if hasattr(c, "severity") else c.get("severity", ""),
-                category=c.category if hasattr(c, "category") else c.get("category", ""),
-                comment=c.comment if hasattr(c, "comment") else c.get("comment", ""),
-                suggestion=c.suggestion if hasattr(c, "suggestion") else c.get("suggestion", ""),
-                reproduction=c.reproduction if hasattr(c, "reproduction") else c.get("reproduction"),
-            )
-            db.add(db_comment)
-
-        review.status = "completed"
-        review.completed_at = datetime.now(timezone.utc)
-        await db.commit()
-    except Exception as e:
-        logger.exception("Review failed: %s", e)
-        review.status = "failed"
-        await db.commit()
-        raise HTTPException(status_code=500, detail=str(e))
-
-    return {"review_id": review.id, "status": review.status}
+    return {"review_id": review.id, "status": "pending"}
 
 
 @router.get("/history")
@@ -120,6 +91,7 @@ async def get_review(review_id: int, db: AsyncSession = Depends(get_db)):
         "pr_number": review.pr_number,
         "status": review.status,
         "created_at": review.created_at.isoformat() if review.created_at else None,
+        "completed_at": review.completed_at.isoformat() if review.completed_at else None,
         "comments": [
             {
                 "id": c.id,

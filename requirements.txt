@@ -2,6 +2,7 @@
 fastapi
 uvicorn[standard]
 anthropic
+openai
 pygithub
 httpx
 sqlalchemy[asyncio]
@@ -9,3 +10,5 @@ aiosqlite
 alembic
 pydantic-settings
 python-dotenv
+celery[redis]
+redis
