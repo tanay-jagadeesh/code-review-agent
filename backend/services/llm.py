@@ -3,6 +3,7 @@
 import json
 import time
 from pathlib import Path
+from dataclasses import dataclass, field
 from pydantic import BaseModel
 from backend.services.diff_parser import FileDiff
 from backend.config import load_config
@@ -20,6 +21,76 @@ class ReviewComment(BaseModel):
     comment: str
     suggestion: str
     reproduction: str | None = None
+
+
+@dataclass
+class ReviewMetrics:
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_write_tokens: int = 0
+    cache_read_tokens: int = 0
+    files_reviewed: int = 0
+    total_files: int = 0
+    filtered_files: int = 0
+    elapsed_seconds: float = 0.0
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+    @property
+    def cache_hit_rate(self) -> float:
+        total_input = self.input_tokens + self.cache_read_tokens
+        if total_input == 0:
+            return 0.0
+        return self.cache_read_tokens / total_input
+
+    @property
+    def noise_filter_rate(self) -> float:
+        if self.total_files == 0:
+            return 0.0
+        return self.filtered_files / self.total_files
+
+    @property
+    def estimated_cost_saved_usd(self) -> float:
+        # Cache reads cost 10% of normal input tokens (sonnet-4: $3/1M input, $0.30/1M cache read)
+        normal_cost_per_1m = 3.0
+        cache_cost_per_1m = 0.30
+        saved = (self.cache_read_tokens / 1_000_000) * (normal_cost_per_1m - cache_cost_per_1m)
+        return round(saved, 4)
+
+    def summary(self) -> str:
+        lines = [
+            f"Files in PR:         {self.total_files}  (filtered: {self.filtered_files}  reviewed: {self.files_reviewed})",
+        ]
+        if self.total_files:
+            lines.append(f"Noise filter rate:   {self.noise_filter_rate:.0%}")
+        lines.append(
+            f"Total tokens:        {self.total_tokens:,}  (in: {self.input_tokens:,}  out: {self.output_tokens:,})"
+        )
+        if self.cache_read_tokens or self.cache_write_tokens:
+            lines += [
+                f"Cache write tokens:  {self.cache_write_tokens:,}",
+                f"Cache read tokens:   {self.cache_read_tokens:,}",
+                f"Cache hit rate:      {self.cache_hit_rate:.0%}",
+                f"Est. cost saved:     ${self.estimated_cost_saved_usd:.4f}",
+            ]
+        lines.append(f"Elapsed:             {self.elapsed_seconds:.1f}s")
+        return "\n".join(lines)
+
+
+# Global metrics accumulator for the current review run
+_current_metrics: ReviewMetrics | None = None
+
+
+def start_metrics() -> ReviewMetrics:
+    global _current_metrics
+    _current_metrics = ReviewMetrics()
+    return _current_metrics
+
+
+def get_metrics() -> ReviewMetrics | None:
+    return _current_metrics
 
 
 # ── Prompt loading ──────────────────────────────────────────────
@@ -241,6 +312,12 @@ def _call_openai(
 
     use_tools = owner is not None and repo is not None
 
+    def _record_usage(usage) -> None:
+        if _current_metrics is None or usage is None:
+            return
+        _current_metrics.input_tokens += getattr(usage, "prompt_tokens", 0)
+        _current_metrics.output_tokens += getattr(usage, "completion_tokens", 0)
+
     for _ in range(MAX_TOOL_ROUNDS):
         response = client.chat.completions.create(
             model=model,
@@ -248,14 +325,13 @@ def _call_openai(
             temperature=0,
             **({"tools": TOOLS_OPENAI} if use_tools else {}),
         )
+        _record_usage(response.usage)
 
         choice = response.choices[0]
 
-        # No tool calls — we have the final answer
         if not choice.message.tool_calls:
             return choice.message.content
 
-        # Process tool calls
         messages.append(choice.message)
         for tc in choice.message.tool_calls:
             args = json.loads(tc.function.arguments)
@@ -270,6 +346,7 @@ def _call_openai(
     response = client.chat.completions.create(
         model=model, messages=messages, temperature=0,
     )
+    _record_usage(response.usage)
     return response.choices[0].message.content
 
 
@@ -282,22 +359,39 @@ def _call_anthropic(
     from anthropic import Anthropic
     client = Anthropic(api_key=api_key)
 
+    # Cache the system prompt — it's identical across all files in a PR
+    system_with_cache = [
+        {
+            "type": "text",
+            "text": system_prompt,
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+
     messages = [{"role": "user", "content": user_message}]
     use_tools = owner is not None and repo is not None
+
+    def _record_usage(usage) -> None:
+        if _current_metrics is None:
+            return
+        _current_metrics.input_tokens += getattr(usage, "input_tokens", 0)
+        _current_metrics.output_tokens += getattr(usage, "output_tokens", 0)
+        _current_metrics.cache_write_tokens += getattr(usage, "cache_creation_input_tokens", 0)
+        _current_metrics.cache_read_tokens += getattr(usage, "cache_read_input_tokens", 0)
 
     for _ in range(MAX_TOOL_ROUNDS):
         response = client.messages.create(
             model=model,
             max_tokens=4096,
-            system=system_prompt,
+            system=system_with_cache,
             messages=messages,
             temperature=0,
             **({"tools": TOOLS_ANTHROPIC} if use_tools else {}),
         )
+        _record_usage(response.usage)
 
         # Check if the model wants to use tools
         if response.stop_reason != "tool_use":
-            # Extract text from response
             for block in response.content:
                 if hasattr(block, "text"):
                     return block.text
@@ -321,9 +415,10 @@ def _call_anthropic(
 
     # Exhausted tool rounds — get final answer without tools
     response = client.messages.create(
-        model=model, max_tokens=4096, system=system_prompt,
+        model=model, max_tokens=4096, system=system_with_cache,
         messages=messages, temperature=0,
     )
+    _record_usage(response.usage)
     for block in response.content:
         if hasattr(block, "text"):
             return block.text
@@ -349,7 +444,6 @@ def review_file(
     system_prompt = _load_system_prompt()
     user_message = _build_user_message(file_diff, context, repo_patterns, custom_rules)
 
-    # Retry loop for transient failures
     last_error = None
     for attempt in range(MAX_RETRIES):
         try:
@@ -364,10 +458,13 @@ def review_file(
                     raise RuntimeError("No OpenAI API key. Run: cr config set openai_api_key <key>")
                 raw = _call_openai(model, system_prompt, user_message, api_key, owner, repo)
 
-            return _parse_response(raw)
+            result = _parse_response(raw)
+            if _current_metrics is not None:
+                _current_metrics.files_reviewed += 1
+            return result
 
         except RuntimeError:
-            raise  # Don't retry config errors
+            raise
         except json.JSONDecodeError as e:
             last_error = e
             if attempt < MAX_RETRIES - 1:

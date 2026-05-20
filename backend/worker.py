@@ -47,7 +47,7 @@ def run_review_task(self, review_id: int, pr_url: str, model: str | None = None)
         review.status = "in_progress"
         session.commit()
 
-        comments = run_review(pr_url, model=model)
+        comments, _ = run_review(pr_url, model=model)
 
         for c in comments:
             session.add(ReviewComment(

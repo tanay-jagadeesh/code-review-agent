@@ -17,12 +17,18 @@ class FileDiff(BaseModel):
     changed_lines: list[int]
 
     @staticmethod
-    def parse_diff(raw_diff: str, extra_ignore: list[str] | None = None) -> list["FileDiff"]:
+    def parse_diff(
+        raw_diff: str,
+        extra_ignore: list[str] | None = None,
+    ) -> tuple[list["FileDiff"], int, int]:
+        """Returns (file_diffs, total_files, filtered_files)."""
         ignore_patterns = DEFAULT_IGNORE + (extra_ignore or [])
 
         chunks = raw_diff.split('diff --git')
         chunks = [chunk for chunk in chunks if chunk.strip()]
         results = []
+        total = 0
+        filtered = 0
 
         for chunk in chunks:
             lines = chunk.split('\n')
@@ -42,18 +48,22 @@ class FileDiff(BaseModel):
                 elif line.startswith('@@'):
                     changed_lines += parse_hunk(line)
 
-            if any(fnmatch.fnmatch(filename, pat) for pat in ignore_patterns):
+            if not filename:
                 continue
 
-            if filename:
-                results.append(FileDiff(
-                    filename=filename,
-                    change_type=change_type,
-                    diff_content=chunk,
-                    changed_lines=changed_lines,
-                ))
+            total += 1
+            if any(fnmatch.fnmatch(filename, pat) for pat in ignore_patterns):
+                filtered += 1
+                continue
 
-        return results
+            results.append(FileDiff(
+                filename=filename,
+                change_type=change_type,
+                diff_content=chunk,
+                changed_lines=changed_lines,
+            ))
+
+        return results, total, filtered
 
 
 def parse_hunk(line):

@@ -133,6 +133,9 @@ def review(pr_url: str, post: bool, model: str | None, fmt: str, exit_code: bool
     from backend.services.llm import review_file
     from backend.services.pattern_service import load_patterns
 
+    import time as _time
+    from backend.services.llm import start_metrics
+
     config = load_config()
     owner, repo, pr_num = parse_pr_url(pr_url)
 
@@ -144,7 +147,7 @@ def review(pr_url: str, post: bool, model: str | None, fmt: str, exit_code: bool
 
     with console.status("[dim]Fetching diff from GitHub...[/dim]") if fmt == "text" else _nullcontext():
         raw_diff = fetch_diff(owner, repo, pr_num)
-        file_diffs = FileDiff.parse_diff(raw_diff, extra_ignore=ignore_paths)
+        file_diffs, total_files, filtered_files = FileDiff.parse_diff(raw_diff, extra_ignore=ignore_paths)
 
     if not file_diffs:
         if fmt == "json":
@@ -154,11 +157,17 @@ def review(pr_url: str, post: bool, model: str | None, fmt: str, exit_code: bool
         return
 
     if fmt == "text":
-        console.print(f"  [dim]{len(file_diffs)} file{'s' if len(file_diffs) != 1 else ''} to review[/dim]")
+        skipped = f", {filtered_files} skipped" if filtered_files else ""
+        console.print(f"  [dim]{len(file_diffs)} file{'s' if len(file_diffs) != 1 else ''} to review{skipped}[/dim]")
         console.print()
 
     use_model = model or config.get("model", "gpt-4o")
     repo_patterns = load_patterns(owner, repo)
+
+    metrics = start_metrics()
+    metrics.total_files = total_files
+    metrics.filtered_files = filtered_files
+    t0 = _time.monotonic()
 
     all_comments = []
     for i, fd in enumerate(file_diffs, 1):
@@ -174,10 +183,17 @@ def review(pr_url: str, post: bool, model: str | None, fmt: str, exit_code: bool
                 console.print(f"\n  [red]{e}[/red]")
             raise SystemExit(1)
 
+    metrics.elapsed_seconds = _time.monotonic() - t0
+
     if fmt == "json":
         click.echo(_comments_to_json(all_comments))
     else:
         _render_comments(all_comments)
+        if metrics.total_tokens > 0:
+            console.print(Rule("[dim]metrics[/dim]", style="dim"))
+            for line in metrics.summary().splitlines():
+                console.print(f"  [dim]{line}[/dim]")
+            console.print()
 
     if post and all_comments:
         from backend.services.github_service import post_review as gh_post
@@ -224,7 +240,7 @@ def diff(staged: bool, model: str | None, fmt: str, exit_code: bool):
         return
 
     ignore_paths = config.get("ignore_paths", [])
-    file_diffs = FileDiff.parse_diff(raw_diff, extra_ignore=ignore_paths)
+    file_diffs, _, _ = FileDiff.parse_diff(raw_diff, extra_ignore=ignore_paths)
     if not file_diffs:
         if fmt == "json":
             click.echo("[]")
